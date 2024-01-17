@@ -43,7 +43,7 @@
                                            LIBAVFORMAT_VERSION_MICRO)
 #define LIBAVFORMAT_BUILD       LIBAVFORMAT_VERSION_INT
 
-#define LIBAVFORMAT_IDENT       "Lavf" AV_STRINGIFY(LIBAVFORMAT_VERSION)
+#define LIBAVFORMAT_IDENT       ""
 
 /**
  * FF_API_* defines may be placed below to indicate public API that will be
