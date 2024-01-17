@@ -129,6 +129,9 @@ typedef struct MOVFragmentStreamInfo {
     int64_t sidx_pts;
     int64_t first_tfra_pts;
     int64_t tfdt_dts;
+    int64_t next_trun_dts;
+    // Index of the first sample/trun in the fragment.
+    int index_base;
     int index_entry;
     MOVEncryptionIndex *encryption_index;
 } MOVFragmentStreamInfo;
@@ -234,6 +237,7 @@ typedef struct MOVStreamContext {
     int has_sidx;  // If there is an sidx entry for this stream.
     struct {
         struct AVAESCTR* aes_ctr;
+        struct AVAES *aes_ctx;
         unsigned int per_sample_iv_size;  // Either 0, 8, or 16.
         AVEncryptionInfo *default_encrypted_sample;
         MOVEncryptionIndex *encryption_index;
