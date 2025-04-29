@@ -5380,7 +5380,7 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
         } else {
             if (trk->cenc.aes_ctr) {
                 size = ff_mov_cenc_avc_parse_nal_units(&trk->cenc, pb, pkt->data, size);
-                if (size < 0)
+                if (size < 0) {
                     ret = size;
                     goto err;
                 }
