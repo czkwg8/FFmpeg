@@ -53,6 +53,7 @@
 #include "avio_internal.h"
 #include "internal.h"
 #include "isom.h"
+#include "libavutil/aes_ctr.h"
 #include "matroska.h"
 #include "oggdec.h"
 /* For ff_codec_get_id(). */
@@ -253,6 +254,10 @@ typedef struct MatroskaTrack {
 
     uint32_t palette[AVPALETTE_COUNT];
     int has_palette;
+
+    struct AVAESCTR *aes_ctr;
+    uint8_t active_key_id[16];
+    int has_active_key_id;
 } MatroskaTrack;
 
 typedef struct MatroskaAttachment {
@@ -386,6 +391,12 @@ typedef struct MatroskaDemuxContext {
 
     /* Bandwidth value for WebM DASH Manifest */
     int bandwidth;
+
+    uint8_t *decryption_key;
+    int decryption_key_len;
+    char *decryption_keys;
+    MOVAESDecryptionKey *parsed_decryption_keys;
+    int nb_parsed_decryption_keys;
 } MatroskaDemuxContext;
 
 #define CHILD_OF(parent) { .def = { .n = parent } }
@@ -2828,6 +2839,97 @@ static int matroska_parse_tracks(AVFormatContext *s)
     return 0;
 }
 
+static int matroska_hexchar2int(char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+static int matroska_parse_hex_string(const char *str, uint8_t *dst, int max_len) {
+    int len = strlen(str);
+    if (len != max_len * 2)
+        return AVERROR(EINVAL);
+    for (int i = 0; i < max_len; i++) {
+        int a = matroska_hexchar2int(str[i * 2]);
+        int b = matroska_hexchar2int(str[i * 2 + 1]);
+        if (a < 0 || b < 0)
+            return AVERROR(EINVAL);
+        dst[i] = (a << 4) | b;
+    }
+    return 0;
+}
+
+static int matroska_parse_decryption_keys(AVFormatContext *s) {
+    MatroskaDemuxContext *matroska = s->priv_data;
+    char *keys_str;
+    char *p, *saveptr = NULL;
+    int count = 0;
+    int allocated = 0;
+    int ret = 0;
+
+    if (!matroska->decryption_keys)
+        return 0;
+
+    keys_str = av_strdup(matroska->decryption_keys);
+    if (!keys_str)
+        return AVERROR(ENOMEM);
+
+    p = av_strtok(keys_str, "|", &saveptr);
+    while (p) {
+        char *kid_hex;
+        char *key_hex;
+        MOVAESDecryptionKey *new_keys;
+        char *colon = strchr(p, ':');
+        if (!colon) {
+            av_log(s, AV_LOG_ERROR, "Invalid decryption_keys format, expected kid:key separated by |\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+        *colon = '\0';
+        kid_hex = p;
+        key_hex = colon + 1;
+
+        if (strlen(kid_hex) != 32 || strlen(key_hex) != 32) {
+            av_log(s, AV_LOG_ERROR, "Invalid decryption_keys hex length: kid and key must be 32 hex characters (16 bytes) long\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+
+        new_keys = av_fast_realloc(
+            matroska->parsed_decryption_keys, &allocated,
+            (count + 1) * sizeof(*new_keys));
+        if (!new_keys) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        matroska->parsed_decryption_keys = new_keys;
+
+        ret = matroska_parse_hex_string(kid_hex, matroska->parsed_decryption_keys[count].kid, 16);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "Invalid hex in kid: %s\n", kid_hex);
+            goto fail;
+        }
+        ret = matroska_parse_hex_string(key_hex, matroska->parsed_decryption_keys[count].key, 16);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "Invalid hex in key: %s\n", key_hex);
+            goto fail;
+        }
+
+        count++;
+        p = av_strtok(NULL, "|", &saveptr);
+    }
+
+    matroska->nb_parsed_decryption_keys = count;
+
+fail:
+    av_free(keys_str);
+    return ret;
+}
+
 static int matroska_read_header(AVFormatContext *s)
 {
     MatroskaDemuxContext *matroska = s->priv_data;
@@ -2842,6 +2944,17 @@ static int matroska_read_header(AVFormatContext *s)
 
     matroska->ctx = s;
     matroska->cues_parsing_deferred = 1;
+
+    if (matroska->decryption_key_len != 0 && matroska->decryption_key_len != 16) {
+        av_log(s, AV_LOG_ERROR, "Invalid decryption_key size (%d), must be 16\n",
+               matroska->decryption_key_len);
+        return AVERROR(EINVAL);
+    }
+    if (matroska->decryption_keys) {
+        res = matroska_parse_decryption_keys(s);
+        if (res < 0)
+            return res;
+    }
 
     /* First read the EBML header. */
     if (ebml_parse(matroska, ebml_syntax, &ebml) || !ebml.doctype) {
@@ -3449,6 +3562,180 @@ static int matroska_parse_frame(MatroskaDemuxContext *matroska,
     uint8_t *pkt_data = data;
     int res = 0;
     AVPacket pktl, *pkt = &pktl;
+    AVEncryptionInfo *encryption_info = NULL;
+
+    if (encodings && encodings->type == 1 && encodings->scope & 1) {
+        uint8_t signal_byte;
+        int encrypted, partitioned;
+        int header_size = 1;
+        uint8_t iv[8] = {0};
+        uint8_t num_partitions = 0;
+        uint32_t *partition_offsets = NULL;
+        int frame_size;
+
+        if (pkt_size < 1) {
+            av_log(matroska->ctx, AV_LOG_ERROR, "Encrypted frame is too small (size %d)\n", pkt_size);
+            return AVERROR_INVALIDDATA;
+        }
+
+        signal_byte = pkt_data[0];
+        encrypted = signal_byte & 0x01;
+        partitioned = signal_byte & 0x02;
+
+        if (encrypted) {
+            if (pkt_size < header_size + 8) {
+                av_log(matroska->ctx, AV_LOG_ERROR, "Encrypted frame too small for IV\n");
+                return AVERROR_INVALIDDATA;
+            }
+            memcpy(iv, pkt_data + header_size, 8);
+            header_size += 8;
+
+            if (partitioned) {
+                if (pkt_size < header_size + 1) {
+                    av_log(matroska->ctx, AV_LOG_ERROR, "Encrypted partitioned frame too small for partition count\n");
+                    return AVERROR_INVALIDDATA;
+                }
+                num_partitions = pkt_data[header_size];
+                header_size += 1;
+
+                if (num_partitions > 0) {
+                    if (pkt_size < header_size + num_partitions * 4) {
+                        av_log(matroska->ctx, AV_LOG_ERROR, "Encrypted partitioned frame too small for partition offsets\n");
+                        return AVERROR_INVALIDDATA;
+                    }
+                    partition_offsets = av_malloc_array(num_partitions, sizeof(uint32_t));
+                    if (!partition_offsets)
+                        return AVERROR(ENOMEM);
+                    for (int i = 0; i < num_partitions; i++) {
+                        partition_offsets[i] = AV_RB32(pkt_data + header_size + i * 4);
+                    }
+                    header_size += num_partitions * 4;
+                }
+            }
+        }
+
+        frame_size = pkt_size - header_size;
+        if (frame_size > 0) {
+            uint8_t *payload = pkt_data + header_size;
+            uint8_t *key = NULL;
+            uint8_t key_id[16] = {0};
+            int key_id_size = 0;
+            uint8_t iv_16[16] = {0};
+            uint32_t *B = NULL;
+            int subsample_count = 0;
+
+            if (encodings->encryption.key_id.size > 0 && encodings->encryption.key_id.data) {
+                key_id_size = FFMIN(encodings->encryption.key_id.size, 16);
+                memcpy(key_id, encodings->encryption.key_id.data, key_id_size);
+            }
+
+            if (matroska->nb_parsed_decryption_keys > 0 && key_id_size == 16) {
+                for (int i = 0; i < matroska->nb_parsed_decryption_keys; i++) {
+                    if (memcmp(matroska->parsed_decryption_keys[i].kid, key_id, 16) == 0) {
+                        key = matroska->parsed_decryption_keys[i].key;
+                        break;
+                    }
+                }
+            }
+            if (!key) {
+                key = matroska->decryption_key;
+            }
+
+            if (encrypted) {
+                memcpy(iv_16, iv, 8);
+            }
+
+            if (partitioned && num_partitions > 0) {
+                int N = num_partitions;
+                B = av_malloc_array(N + 2, sizeof(uint32_t));
+                if (!B) {
+                    av_free(partition_offsets);
+                    return AVERROR(ENOMEM);
+                }
+                B[0] = 0;
+                for (int i = 0; i < N; i++) {
+                    B[i + 1] = partition_offsets[i];
+                }
+                B[N + 1] = frame_size;
+
+                int valid = 1;
+                for (int i = 0; i <= N; i++) {
+                    if (B[i + 1] < B[i]) {
+                        valid = 0;
+                        break;
+                    }
+                }
+                if (!valid) {
+                    av_log(matroska->ctx, AV_LOG_ERROR, "Invalid partition offset boundaries\n");
+                    av_free(B);
+                    av_free(partition_offsets);
+                    return AVERROR_INVALIDDATA;
+                }
+                subsample_count = (num_partitions + 2) / 2;
+            }
+
+            if (key && encrypted) {
+                if (!track->aes_ctr) {
+                    track->aes_ctr = av_aes_ctr_alloc();
+                    if (!track->aes_ctr) {
+                        av_free(B);
+                        av_free(partition_offsets);
+                        return AVERROR(ENOMEM);
+                    }
+                }
+                res = av_aes_ctr_init(track->aes_ctr, key);
+                if (res < 0) {
+                    av_free(B);
+                    av_free(partition_offsets);
+                    return res;
+                }
+                av_aes_ctr_set_full_iv(track->aes_ctr, iv_16);
+
+                if (!partitioned || num_partitions == 0) {
+                    av_aes_ctr_crypt(track->aes_ctr, payload, payload, frame_size);
+                } else {
+                    uint8_t *cur = payload;
+                    for (int i = 0; i <= num_partitions; i++) {
+                        uint32_t section_size = B[i + 1] - B[i];
+                        if (i % 2 == 1) {
+                            av_aes_ctr_crypt(track->aes_ctr, cur, cur, section_size);
+                        }
+                        cur += section_size;
+                    }
+                }
+            } else if (encrypted) {
+                encryption_info = av_encryption_info_alloc(subsample_count, 16, 16);
+                if (!encryption_info) {
+                    av_free(B);
+                    av_free(partition_offsets);
+                    return AVERROR(ENOMEM);
+                }
+                encryption_info->scheme = MKTAG('c', 'e', 'n', 'c');
+                memcpy(encryption_info->iv, iv_16, 16);
+                if (key_id_size == 16) {
+                    memcpy(encryption_info->key_id, key_id, 16);
+                }
+                if (subsample_count > 0) {
+                    for (int j = 0; j < subsample_count; j++) {
+                        encryption_info->subsamples[j].bytes_of_clear_data = B[2 * j + 1] - B[2 * j];
+                        encryption_info->subsamples[j].bytes_of_protected_data =
+                            (2 * j + 1 <= num_partitions) ? (B[2 * j + 2] - B[2 * j + 1]) : 0;
+                    }
+                }
+            }
+
+            av_free(B);
+        }
+
+        av_free(partition_offsets);
+
+        if (header_size > 0 && header_size < pkt_size) {
+            memmove(pkt_data, pkt_data + header_size, pkt_size - header_size);
+            pkt_size -= header_size;
+        } else if (header_size >= pkt_size) {
+            pkt_size = 0;
+        }
+    }
 
     if (encodings && !encodings->type && encodings->scope & 1) {
         res = matroska_decode_buffer(&pkt_data, &pkt_size, track);
@@ -3502,6 +3789,26 @@ static int matroska_parse_frame(MatroskaDemuxContext *matroska,
     pkt->size         = pkt_size;
     pkt->flags        = is_keyframe;
     pkt->stream_index = st->index;
+
+    if (encryption_info) {
+        size_t side_data_size = 0;
+        uint8_t *side_data = av_encryption_info_add_side_data(encryption_info, &side_data_size);
+        if (side_data) {
+            res = av_packet_add_side_data(pkt, AV_PKT_DATA_ENCRYPTION_INFO, side_data, side_data_size);
+            if (res < 0) {
+                av_free(side_data);
+                av_encryption_info_free(encryption_info);
+                av_packet_unref(pkt);
+                goto fail;
+            }
+        } else {
+            av_encryption_info_free(encryption_info);
+            av_packet_unref(pkt);
+            res = AVERROR(ENOMEM);
+            goto fail;
+        }
+        av_encryption_info_free(encryption_info);
+    }
 
     if (additional_size > 0) {
         uint8_t *side_data = av_packet_new_side_data(pkt,
@@ -3852,9 +4159,13 @@ static int matroska_read_close(AVFormatContext *s)
 
     matroska_clear_queue(matroska);
 
-    for (n = 0; n < matroska->tracks.nb_elem; n++)
+    for (n = 0; n < matroska->tracks.nb_elem; n++) {
         if (tracks[n].type == MATROSKA_TRACK_TYPE_AUDIO)
             av_freep(&tracks[n].audio.buf);
+        if (tracks[n].aes_ctr)
+            av_aes_ctr_free(tracks[n].aes_ctr);
+    }
+    av_freep(&matroska->parsed_decryption_keys);
     ebml_free(matroska_segment, matroska);
 
     return 0;
@@ -4285,6 +4596,19 @@ static const AVClass webm_dash_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
+static const AVOption matroska_options[] = {
+    { "decryption_key", "The media decryption key (hex)", OFFSET(decryption_key), AV_OPT_TYPE_BINARY, .flags = AV_OPT_FLAG_DECODING_PARAM },
+    { "decryption_keys", "A list of kid:key pairs (hex) separated by |", OFFSET(decryption_keys), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_DECODING_PARAM },
+    { NULL },
+};
+
+static const AVClass matroska_class = {
+    .class_name = "Matroska / WebM demuxer",
+    .item_name  = av_default_item_name,
+    .option     = matroska_options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
 AVInputFormat ff_matroska_demuxer = {
     .name           = "matroska,webm",
     .long_name      = NULL_IF_CONFIG_SMALL("Matroska / WebM"),
@@ -4295,7 +4619,8 @@ AVInputFormat ff_matroska_demuxer = {
     .read_packet    = matroska_read_packet,
     .read_close     = matroska_read_close,
     .read_seek      = matroska_read_seek,
-    .mime_type      = "audio/webm,audio/x-matroska,video/webm,video/x-matroska"
+    .mime_type      = "audio/webm,audio/x-matroska,video/webm,video/x-matroska",
+    .priv_class     = &matroska_class
 };
 
 AVInputFormat ff_webm_dash_manifest_demuxer = {

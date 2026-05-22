@@ -6662,6 +6662,9 @@ static int mov_parse_decryption_keys(MOVContext *c) {
 
     p = av_strtok(keys_str, "|", &saveptr);
     while (p) {
+        char *kid_hex;
+        char *key_hex;
+        MOVAESDecryptionKey *new_keys;
         char *colon = strchr(p, ':');
         if (!colon) {
             av_log(c->fc, AV_LOG_ERROR, "Invalid decryption_keys format, expected kid:key separated by |\n");
@@ -6669,8 +6672,8 @@ static int mov_parse_decryption_keys(MOVContext *c) {
             goto fail;
         }
         *colon = '\0';
-        char *kid_hex = p;
-        char *key_hex = colon + 1;
+        kid_hex = p;
+        key_hex = colon + 1;
 
         if (strlen(kid_hex) != 32 || strlen(key_hex) != 32) {
             av_log(c->fc, AV_LOG_ERROR, "Invalid decryption_keys hex length: kid and key must be 32 hex characters (16 bytes) long\n");
@@ -6678,7 +6681,7 @@ static int mov_parse_decryption_keys(MOVContext *c) {
             goto fail;
         }
 
-        MOVAESDecryptionKey *new_keys = av_fast_realloc(
+        new_keys = av_fast_realloc(
             c->parsed_decryption_keys, &allocated,
             (count + 1) * sizeof(*new_keys));
         if (!new_keys) {
