@@ -6622,10 +6622,117 @@ static int mov_read_dfla(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     return 0;
 }
 
+static int hexchar2int(char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+static int parse_hex_string(const char *str, uint8_t *dst, int max_len) {
+    int len = strlen(str);
+    if (len != max_len * 2)
+        return AVERROR(EINVAL);
+    for (int i = 0; i < max_len; i++) {
+        int a = hexchar2int(str[i * 2]);
+        int b = hexchar2int(str[i * 2 + 1]);
+        if (a < 0 || b < 0)
+            return AVERROR(EINVAL);
+        dst[i] = (a << 4) | b;
+    }
+    return 0;
+}
+
+static int mov_parse_decryption_keys(MOVContext *c) {
+    char *keys_str;
+    char *p, *saveptr = NULL;
+    int count = 0;
+    int allocated = 0;
+    int ret = 0;
+
+    if (!c->decryption_keys)
+        return 0;
+
+    keys_str = av_strdup(c->decryption_keys);
+    if (!keys_str)
+        return AVERROR(ENOMEM);
+
+    p = av_strtok(keys_str, "|", &saveptr);
+    while (p) {
+        char *colon = strchr(p, ':');
+        if (!colon) {
+            av_log(c->fc, AV_LOG_ERROR, "Invalid decryption_keys format, expected kid:key separated by |\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+        *colon = '\0';
+        char *kid_hex = p;
+        char *key_hex = colon + 1;
+
+        if (strlen(kid_hex) != 32 || strlen(key_hex) != 32) {
+            av_log(c->fc, AV_LOG_ERROR, "Invalid decryption_keys hex length: kid and key must be 32 hex characters (16 bytes) long\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+
+        MOVAESDecryptionKey *new_keys = av_fast_realloc(
+            c->parsed_decryption_keys, &allocated,
+            (count + 1) * sizeof(*new_keys));
+        if (!new_keys) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        c->parsed_decryption_keys = new_keys;
+
+        ret = parse_hex_string(kid_hex, c->parsed_decryption_keys[count].kid, 16);
+        if (ret < 0) {
+            av_log(c->fc, AV_LOG_ERROR, "Invalid hex in kid: %s\n", kid_hex);
+            goto fail;
+        }
+        ret = parse_hex_string(key_hex, c->parsed_decryption_keys[count].key, 16);
+        if (ret < 0) {
+            av_log(c->fc, AV_LOG_ERROR, "Invalid hex in key: %s\n", key_hex);
+            goto fail;
+        }
+
+        count++;
+        p = av_strtok(NULL, "|", &saveptr);
+    }
+
+    c->nb_parsed_decryption_keys = count;
+
+fail:
+    av_free(keys_str);
+    return ret;
+}
+
+static uint8_t *mov_find_decryption_key(MOVContext *c, const uint8_t *key_id, int key_id_size) {
+    if (key_id_size != 16)
+        return NULL;
+    for (int i = 0; i < c->nb_parsed_decryption_keys; i++) {
+        if (memcmp(c->parsed_decryption_keys[i].kid, key_id, 16) == 0) {
+            return c->parsed_decryption_keys[i].key;
+        }
+    }
+    return NULL;
+}
+
 static int cenc_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryptionInfo *sample, uint8_t *input, int size)
 {
     int i, ret;
     int bytes_of_protected_data;
+    uint8_t *key = c->decryption_key;
+
+    if (c->nb_parsed_decryption_keys > 0) {
+        key = mov_find_decryption_key(c, sample->key_id, sample->key_id_size);
+        if (!key) {
+            av_log(c->fc, AV_LOG_ERROR, "No decryption key found for key ID\n");
+            return AVERROR(EINVAL);
+        }
+    }
 
     if (!sc->cenc.aes_ctr) {
         /* initialize the cipher */
@@ -6634,9 +6741,22 @@ static int cenc_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
             return AVERROR(ENOMEM);
         }
 
-        ret = av_aes_ctr_init(sc->cenc.aes_ctr, c->decryption_key);
+        ret = av_aes_ctr_init(sc->cenc.aes_ctr, key);
         if (ret < 0) {
             return ret;
+        }
+        if (c->nb_parsed_decryption_keys > 0 && sample->key_id_size == 16) {
+            memcpy(sc->cenc.active_key_id, sample->key_id, 16);
+            sc->cenc.has_active_key_id = 1;
+        }
+    } else if (c->nb_parsed_decryption_keys > 0 && sample->key_id_size == 16) {
+        if (!sc->cenc.has_active_key_id || memcmp(sc->cenc.active_key_id, sample->key_id, 16) != 0) {
+            ret = av_aes_ctr_init(sc->cenc.aes_ctr, key);
+            if (ret < 0) {
+                return ret;
+            }
+            memcpy(sc->cenc.active_key_id, sample->key_id, 16);
+            sc->cenc.has_active_key_id = 1;
         }
     }
 
@@ -6680,6 +6800,15 @@ static int cbc1_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
     int i, ret;
     int num_of_encrypted_blocks;
     uint8_t iv[16];
+    uint8_t *key = c->decryption_key;
+
+    if (c->nb_parsed_decryption_keys > 0) {
+        key = mov_find_decryption_key(c, sample->key_id, sample->key_id_size);
+        if (!key) {
+            av_log(c->fc, AV_LOG_ERROR, "No decryption key found for key ID\n");
+            return AVERROR(EINVAL);
+        }
+    }
 
     if (!sc->cenc.aes_ctx) {
         /* initialize the cipher */
@@ -6688,9 +6817,22 @@ static int cbc1_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
             return AVERROR(ENOMEM);
         }
 
-        ret = av_aes_init(sc->cenc.aes_ctx, c->decryption_key, 16 * 8, 1);
+        ret = av_aes_init(sc->cenc.aes_ctx, key, 16 * 8, 1);
         if (ret < 0) {
             return ret;
+        }
+        if (c->nb_parsed_decryption_keys > 0 && sample->key_id_size == 16) {
+            memcpy(sc->cenc.active_key_id, sample->key_id, 16);
+            sc->cenc.has_active_key_id = 1;
+        }
+    } else if (c->nb_parsed_decryption_keys > 0 && sample->key_id_size == 16) {
+        if (!sc->cenc.has_active_key_id || memcmp(sc->cenc.active_key_id, sample->key_id, 16) != 0) {
+            ret = av_aes_init(sc->cenc.aes_ctx, key, 16 * 8, 1);
+            if (ret < 0) {
+                return ret;
+            }
+            memcpy(sc->cenc.active_key_id, sample->key_id, 16);
+            sc->cenc.has_active_key_id = 1;
         }
     }
 
@@ -6739,6 +6881,15 @@ static int cens_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
 {
     int i, ret, rem_bytes;
     uint8_t *data;
+    uint8_t *key = c->decryption_key;
+
+    if (c->nb_parsed_decryption_keys > 0) {
+        key = mov_find_decryption_key(c, sample->key_id, sample->key_id_size);
+        if (!key) {
+            av_log(c->fc, AV_LOG_ERROR, "No decryption key found for key ID\n");
+            return AVERROR(EINVAL);
+        }
+    }
 
     if (!sc->cenc.aes_ctr) {
         /* initialize the cipher */
@@ -6747,9 +6898,22 @@ static int cens_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
             return AVERROR(ENOMEM);
         }
 
-        ret = av_aes_ctr_init(sc->cenc.aes_ctr, c->decryption_key);
+        ret = av_aes_ctr_init(sc->cenc.aes_ctr, key);
         if (ret < 0) {
             return ret;
+        }
+        if (c->nb_parsed_decryption_keys > 0 && sample->key_id_size == 16) {
+            memcpy(sc->cenc.active_key_id, sample->key_id, 16);
+            sc->cenc.has_active_key_id = 1;
+        }
+    } else if (c->nb_parsed_decryption_keys > 0 && sample->key_id_size == 16) {
+        if (!sc->cenc.has_active_key_id || memcmp(sc->cenc.active_key_id, sample->key_id, 16) != 0) {
+            ret = av_aes_ctr_init(sc->cenc.aes_ctr, key);
+            if (ret < 0) {
+                return ret;
+            }
+            memcpy(sc->cenc.active_key_id, sample->key_id, 16);
+            sc->cenc.has_active_key_id = 1;
         }
     }
 
@@ -6805,6 +6969,15 @@ static int cbcs_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
     int i, ret, rem_bytes;
     uint8_t iv[16];
     uint8_t *data;
+    uint8_t *key = c->decryption_key;
+
+    if (c->nb_parsed_decryption_keys > 0) {
+        key = mov_find_decryption_key(c, sample->key_id, sample->key_id_size);
+        if (!key) {
+            av_log(c->fc, AV_LOG_ERROR, "No decryption key found for key ID\n");
+            return AVERROR(EINVAL);
+        }
+    }
 
     if (!sc->cenc.aes_ctx) {
         /* initialize the cipher */
@@ -6813,9 +6986,22 @@ static int cbcs_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
             return AVERROR(ENOMEM);
         }
 
-        ret = av_aes_init(sc->cenc.aes_ctx, c->decryption_key, 16 * 8, 1);
+        ret = av_aes_init(sc->cenc.aes_ctx, key, 16 * 8, 1);
         if (ret < 0) {
             return ret;
+        }
+        if (c->nb_parsed_decryption_keys > 0 && sample->key_id_size == 16) {
+            memcpy(sc->cenc.active_key_id, sample->key_id, 16);
+            sc->cenc.has_active_key_id = 1;
+        }
+    } else if (c->nb_parsed_decryption_keys > 0 && sample->key_id_size == 16) {
+        if (!sc->cenc.has_active_key_id || memcmp(sc->cenc.active_key_id, sample->key_id, 16) != 0) {
+            ret = av_aes_init(sc->cenc.aes_ctx, key, 16 * 8, 1);
+            if (ret < 0) {
+                return ret;
+            }
+            memcpy(sc->cenc.active_key_id, sample->key_id, 16);
+            sc->cenc.has_active_key_id = 1;
         }
     }
 
@@ -6954,7 +7140,7 @@ static int cenc_filter(MOVContext *mov, AVStream* st, MOVStreamContext *sc, AVPa
             return AVERROR_INVALIDDATA;
         }
 
-        if (mov->decryption_key) {
+        if (mov->decryption_key || mov->nb_parsed_decryption_keys > 0) {
             return cenc_decrypt(mov, sc, encrypted_sample, pkt->data, pkt->size);
         } else {
             size_t size;
@@ -7580,6 +7766,7 @@ static int mov_read_close(AVFormatContext *s)
 
     av_freep(&mov->aes_decrypt);
     av_freep(&mov->chapter_tracks);
+    av_freep(&mov->parsed_decryption_keys);
 
     return 0;
 }
@@ -7730,6 +7917,12 @@ static int mov_read_header(AVFormatContext *s)
         av_log(s, AV_LOG_ERROR, "Invalid decryption key len %d expected %d\n",
             mov->decryption_key_len, AES_CTR_KEY_SIZE);
         return AVERROR(EINVAL);
+    }
+
+    if (mov->decryption_keys) {
+        err = mov_parse_decryption_keys(mov);
+        if (err < 0)
+            return err;
     }
 
     mov->fc = s;
@@ -8326,6 +8519,7 @@ static const AVOption mov_options[] = {
         AV_OPT_TYPE_BINARY, {.str="77214d4b196a87cd520045fd20a51d67"},
         .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "decryption_key", "The media decryption key (hex)", OFFSET(decryption_key), AV_OPT_TYPE_BINARY, .flags = AV_OPT_FLAG_DECODING_PARAM },
+    { "decryption_keys", "A list of kid:key pairs (hex) separated by |", OFFSET(decryption_keys), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "enable_drefs", "Enable external track support.", OFFSET(enable_drefs), AV_OPT_TYPE_BOOL,
         {.i64 = 0}, 0, 1, FLAGS },
 

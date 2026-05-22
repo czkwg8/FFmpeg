@@ -157,6 +157,11 @@ typedef struct MOVIndexRange {
     int64_t end;
 } MOVIndexRange;
 
+typedef struct MOVAESDecryptionKey {
+    uint8_t kid[16];
+    uint8_t key[16];
+} MOVAESDecryptionKey;
+
 typedef struct MOVStreamContext {
     AVIOContext *pb;
     int pb_is_copied;
@@ -241,6 +246,8 @@ typedef struct MOVStreamContext {
         unsigned int per_sample_iv_size;  // Either 0, 8, or 16.
         AVEncryptionInfo *default_encrypted_sample;
         MOVEncryptionIndex *encryption_index;
+        uint8_t active_key_id[16];
+        int has_active_key_id;
     } cenc;
 } MOVStreamContext;
 
@@ -292,6 +299,9 @@ typedef struct MOVContext {
     int decryption_key_len;
     int enable_drefs;
     int32_t movie_display_matrix[3][3]; ///< display matrix from mvhd
+    char *decryption_keys;
+    MOVAESDecryptionKey *parsed_decryption_keys;
+    int nb_parsed_decryption_keys;
 } MOVContext;
 
 int ff_mp4_read_descr_len(AVIOContext *pb);
