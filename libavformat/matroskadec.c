@@ -3675,6 +3675,7 @@ static int matroska_parse_frame(MatroskaDemuxContext *matroska,
             }
 
             if (key && encrypted) {
+                int key_changed = 0;
                 if (!track->aes_ctr) {
                     track->aes_ctr = av_aes_ctr_alloc();
                     if (!track->aes_ctr) {
@@ -3682,12 +3683,29 @@ static int matroska_parse_frame(MatroskaDemuxContext *matroska,
                         av_free(partition_offsets);
                         return AVERROR(ENOMEM);
                     }
+                    key_changed = 1;
                 }
-                res = av_aes_ctr_init(track->aes_ctr, key);
-                if (res < 0) {
-                    av_free(B);
-                    av_free(partition_offsets);
-                    return res;
+
+                if (key_id_size == 16) {
+                    if (!track->has_active_key_id || memcmp(track->active_key_id, key_id, 16) != 0) {
+                        key_changed = 1;
+                        memcpy(track->active_key_id, key_id, 16);
+                        track->has_active_key_id = 1;
+                    }
+                } else {
+                    if (track->has_active_key_id) {
+                        key_changed = 1;
+                        track->has_active_key_id = 0;
+                    }
+                }
+
+                if (key_changed) {
+                    res = av_aes_ctr_init(track->aes_ctr, key);
+                    if (res < 0) {
+                        av_free(B);
+                        av_free(partition_offsets);
+                        return res;
+                    }
                 }
                 av_aes_ctr_set_full_iv(track->aes_ctr, iv_16);
 

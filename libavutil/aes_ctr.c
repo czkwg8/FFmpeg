@@ -68,9 +68,11 @@ void av_aes_ctr_set_random_iv(struct AVAESCTR *a)
 
 int av_aes_ctr_init(struct AVAESCTR *a, const uint8_t *key)
 {
-    a->aes = av_aes_alloc();
     if (!a->aes) {
-        return AVERROR(ENOMEM);
+        a->aes = av_aes_alloc();
+        if (!a->aes) {
+            return AVERROR(ENOMEM);
+        }
     }
 
     av_aes_init(a->aes, key, 128, 0);
