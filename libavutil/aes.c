@@ -229,6 +229,9 @@ int av_aes_init(AVAES *a, const uint8_t *key, int key_bits, int decrypt)
         return AVERROR(EINVAL);
 
     a->rounds = rounds;
+#if ARCH_X86
+    ff_init_aes_x86(a, decrypt);
+#endif
 
     memcpy(tk, key, KC * 4);
     memcpy(a->round_key[0].u8, key, KC * 4);

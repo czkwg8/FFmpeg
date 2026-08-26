@@ -6945,15 +6945,37 @@ static int cens_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
         /* decrypt the encrypted bytes */
         data = input;
         rem_bytes = sample->subsamples[i].bytes_of_protected_data;
-        while (rem_bytes > 0) {
-            if (rem_bytes < 16*sample->crypt_byte_block) {
-                break;
+        if (sample->crypt_byte_block == 1 && sample->skip_byte_block == 9) {
+            /* Fast-path for 1:9 pattern in CTR mode */
+            while (rem_bytes >= 160) {
+                av_aes_ctr_crypt(sc->cenc.aes_ctr, data, data, 16);
+                data += 160;
+                rem_bytes -= 160;
             }
-            av_aes_ctr_crypt(sc->cenc.aes_ctr, data, data, 16*sample->crypt_byte_block);
-            data += 16*sample->crypt_byte_block;
-            rem_bytes -= 16*sample->crypt_byte_block;
-            data += FFMIN(16*sample->skip_byte_block, rem_bytes);
-            rem_bytes -= FFMIN(16*sample->skip_byte_block, rem_bytes);
+            if (rem_bytes >= 16) {
+                av_aes_ctr_crypt(sc->cenc.aes_ctr, data, data, 16);
+                data += 16;
+                rem_bytes -= 16;
+                data += rem_bytes;
+                rem_bytes = 0;
+            }
+        } else {
+            int crypt_bytes = 16 * sample->crypt_byte_block;
+            int skip_bytes = 16 * sample->skip_byte_block;
+            int stripe_bytes = crypt_bytes + skip_bytes;
+            while (rem_bytes >= stripe_bytes) {
+                av_aes_ctr_crypt(sc->cenc.aes_ctr, data, data, crypt_bytes);
+                data += stripe_bytes;
+                rem_bytes -= stripe_bytes;
+            }
+            if (rem_bytes >= crypt_bytes) {
+                av_aes_ctr_crypt(sc->cenc.aes_ctr, data, data, crypt_bytes);
+                data += crypt_bytes;
+                rem_bytes -= crypt_bytes;
+                int skip = FFMIN(skip_bytes, rem_bytes);
+                data += skip;
+                rem_bytes -= skip;
+            }
         }
         input += sample->subsamples[i].bytes_of_protected_data;
         size -= sample->subsamples[i].bytes_of_protected_data;
@@ -7033,15 +7055,38 @@ static int cbcs_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
         memcpy(iv, sample->iv, 16);
         data = input;
         rem_bytes = sample->subsamples[i].bytes_of_protected_data;
-        while (rem_bytes > 0) {
-            if (rem_bytes < 16*sample->crypt_byte_block) {
-                break;
+        if (sample->crypt_byte_block == 1 && sample->skip_byte_block == 9) {
+            /* Fast-path for common 1:9 pattern (16 bytes crypt + 144 bytes clear = 160 bytes stripe) */
+            while (rem_bytes >= 160) {
+                av_aes_crypt(sc->cenc.aes_ctx, data, data, 1, iv, 1);
+                data += 160;
+                rem_bytes -= 160;
             }
-            av_aes_crypt(sc->cenc.aes_ctx, data, data, sample->crypt_byte_block, iv, 1);
-            data += 16*sample->crypt_byte_block;
-            rem_bytes -= 16*sample->crypt_byte_block;
-            data += FFMIN(16*sample->skip_byte_block, rem_bytes);
-            rem_bytes -= FFMIN(16*sample->skip_byte_block, rem_bytes);
+            if (rem_bytes >= 16) {
+                av_aes_crypt(sc->cenc.aes_ctx, data, data, 1, iv, 1);
+                data += 16;
+                rem_bytes -= 16;
+                /* Remaining bytes are in skip block (clear) */
+                data += rem_bytes;
+                rem_bytes = 0;
+            }
+        } else {
+            int crypt_bytes = 16 * sample->crypt_byte_block;
+            int skip_bytes = 16 * sample->skip_byte_block;
+            int stripe_bytes = crypt_bytes + skip_bytes;
+            while (rem_bytes >= stripe_bytes) {
+                av_aes_crypt(sc->cenc.aes_ctx, data, data, sample->crypt_byte_block, iv, 1);
+                data += stripe_bytes;
+                rem_bytes -= stripe_bytes;
+            }
+            if (rem_bytes >= crypt_bytes) {
+                av_aes_crypt(sc->cenc.aes_ctx, data, data, sample->crypt_byte_block, iv, 1);
+                data += crypt_bytes;
+                rem_bytes -= crypt_bytes;
+                int skip = FFMIN(skip_bytes, rem_bytes);
+                data += skip;
+                rem_bytes -= skip;
+            }
         }
         input += sample->subsamples[i].bytes_of_protected_data;
         size -= sample->subsamples[i].bytes_of_protected_data;
