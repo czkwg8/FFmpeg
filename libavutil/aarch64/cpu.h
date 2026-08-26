@@ -25,5 +25,6 @@
 #define have_armv8(flags) CPUEXT(flags, ARMV8)
 #define have_neon(flags) CPUEXT(flags, NEON)
 #define have_vfp(flags)  CPUEXT(flags, VFP)
+#define have_aes(flags)  (((flags) & AV_CPU_FLAG_ARM_AES) != 0)
 
 #endif /* AVUTIL_AARCH64_CPU_H */

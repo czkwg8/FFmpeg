@@ -253,6 +253,11 @@ int av_aes_init(AVAES *a, const uint8_t *key, int key_bits, int decrypt)
         memcpy(a->round_key[0].u8 + t, tk, KC * 4);
     }
 
+#if ARCH_AARCH64
+    if (ff_aes_init_aarch64(a, decrypt))
+        return 0;
+#endif
+
     if (decrypt) {
         for (i = 1; i < rounds; i++) {
             av_aes_block tmp[3];

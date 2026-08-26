@@ -69,6 +69,7 @@
 #define AV_CPU_FLAG_NEON         (1 << 5)
 #define AV_CPU_FLAG_ARMV8        (1 << 6)
 #define AV_CPU_FLAG_VFP_VM       (1 << 7) ///< VFPv2 vector mode, deprecated in ARMv7-A and unavailable in various CPUs implementations
+#define AV_CPU_FLAG_ARM_AES      (1 << 14) ///< ARMv8 Crypto AES instructions
 #define AV_CPU_FLAG_SETEND       (1 <<16)
 
 /**
