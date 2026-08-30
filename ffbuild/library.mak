@@ -33,8 +33,10 @@ $(TESTPROGS): THISLIB = $(SUBDIR)$(LIBNAME)
 
 $(LIBOBJS): CPPFLAGS += -DBUILDING_$(NAME)
 
+$(if $(TESTPROGS)$(TOOLS),
 $(TESTPROGS) $(TOOLS): %$(EXESUF): %.o
 	$$(LD) $(LDFLAGS) $(LDEXEFLAGS) $$(LD_O) $$(filter %.o,$$^) $$(THISLIB) $(FFEXTRALIBS) $$(EXTRALIBS-$$(*F)) $$(ELIBS)
+)
 
 $(SUBDIR)lib$(NAME).version: $(SUBDIR)version.h | $(SUBDIR)
 	$$(M) $$(SRC_PATH)/ffbuild/libversion.sh $(NAME) $$< > $$@
